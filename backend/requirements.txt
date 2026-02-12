@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+sentence-transformers
+spacy
+pdfplumber
+python-docx
+python-dotenv
+pydantic-settings
+python-multipart
+pandas
+numpy
+scikit-learn
