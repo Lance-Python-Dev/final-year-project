@@ -8,6 +8,7 @@ function App() {
   const [jobs, setJobs] = useState([]);
   const [selectedJob, setSelectedJob] = useState(null);
   const [rankings, setRankings] = useState([]);
+  const [rankingLimit, setRankingLimit] = useState(10);
   const [jobTitle, setJobTitle] = useState('');
   const [jobDescription, setJobDescription] = useState('');
   const [semanticWeight, setSemanticWeight] = useState(0.8);
@@ -72,7 +73,7 @@ function App() {
     if (!selectedJob) return;
     setLoading(true);
     try {
-      const response = await axios.get(`${API_BASE_URL}/jobs/${selectedJob.id}/rankings?blind_mode=${blindMode}`);
+      const response = await axios.get(`${API_BASE_URL}/jobs/${selectedJob.id}/rankings?blind_mode=${blindMode}&limit=${rankingLimit}`);
       setRankings(response.data);
     } catch (error) {
       console.error("Error fetching rankings:", error);
@@ -85,7 +86,7 @@ function App() {
     if (selectedJob) {
       fetchRankings();
     }
-  }, [blindMode]);
+  }, [blindMode, rankingLimit]);
 
   return (
     <div className="min-h-screen bg-gray-100 p-4 md:p-8 font-sans">
@@ -182,6 +183,16 @@ function App() {
                         <div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${blindMode ? 'left-6' : 'left-1'}`}></div>
                       </button>
                     </div>
+                    <select
+                      value={rankingLimit}
+                      onChange={(e) => setRankingLimit(parseInt(e.target.value))}
+                      className="bg-white border border-gray-200 px-3 py-1 rounded-full text-xs font-bold text-gray-500 outline-none shadow-sm"
+                    >
+                      <option value={5}>Top 5</option>
+                      <option value={10}>Top 10</option>
+                      <option value={20}>Top 20</option>
+                      <option value={50}>Top 50</option>
+                    </select>
                     <button
                       onClick={fetchRankings}
                       className="flex items-center gap-2 bg-gray-100 text-gray-700 px-4 py-2 rounded hover:bg-gray-200 transition"
@@ -247,7 +258,17 @@ function App() {
                         <tr key={index} className="hover:bg-gray-50 transition">
                           <td className="px-6 py-4 font-bold text-gray-500">#{index + 1}</td>
                           <td className="px-6 py-4">
-                            <div className="font-semibold text-gray-800">{r.candidate_name}</div>
+                            <div className="flex items-center gap-2">
+                              <div className="font-semibold text-gray-800">{r.candidate_name}</div>
+                              {r.risk_flag && (
+                                <div className="group relative">
+                                  <AlertCircle className="w-4 h-4 text-amber-500 cursor-help" />
+                                  <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-gray-800 text-white text-[10px] rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-10">
+                                    {r.risk_flag}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
                             <div className="text-xs text-gray-400">{r.email}</div>
                           </td>
                           <td className="px-6 py-4">

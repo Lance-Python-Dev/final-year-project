@@ -155,13 +155,23 @@ class NLPEngine:
     def calculate_similarity(self, embedding1, embedding2):
         return util.cos_sim(embedding1, embedding2).item()
 
-    def rank_candidate(self, jd_text, jd_embedding, cv_text, cv_embedding, experience_years, required_experience=0, semantic_weight=0.8):
+    def rank_candidate(self, jd_text, jd_embedding, cv_text, cv_embedding, experience_years, exp_section_text="", required_experience=0, semantic_weight=0.8):
         # Semantic Score
         semantic_score = self.calculate_similarity(jd_embedding, cv_embedding)
 
         # Experience Score
         target_exp = required_experience if required_experience > 0 else 5.0
         exp_score = min(experience_years / target_exp, 1.0)
+
+        # Anti-Gaming Check
+        risk_flag = None
+        if exp_section_text:
+            exp_section_embedding = self.get_embedding(exp_section_text)
+            exp_section_similarity = self.calculate_similarity(jd_embedding, exp_section_embedding)
+
+            # If full CV matches very high (>95%) but experience section matches low (<50%)
+            if semantic_score > 0.95 and exp_section_similarity < 0.5:
+                risk_flag = "Potential Keyword Stuffing Detected"
 
         # Dynamic weighting
         exp_weight = 1.0 - semantic_weight
@@ -171,5 +181,6 @@ class NLPEngine:
             "semantic_score": round(semantic_score, 4),
             "experience_score": round(exp_score, 4),
             "final_score": round(final_score, 4),
-            "extracted_experience": experience_years
+            "extracted_experience": experience_years,
+            "risk_flag": risk_flag
         }

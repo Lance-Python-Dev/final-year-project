@@ -26,7 +26,7 @@ app.add_middleware(
 )
 
 # Initialize NLP Engine
-nlp_engine = nlp_engine = NLPEngine()
+nlp_engine = NLPEngine()
 
 # Pydantic models for API
 class JobCreateSchema(BaseModel):
@@ -86,8 +86,11 @@ def list_jobs(db: Session = Depends(get_db)):
     return db.query(Job).all()
 
 @app.get("/jobs/{job_id}/rankings")
-def get_rankings(job_id: int, blind_mode: bool = False, db: Session = Depends(get_db)):
-    rankings = db.query(Ranking).filter(Ranking.job_id == job_id).order_by(Ranking.final_score.desc()).all()
+def get_rankings(job_id: int, limit: int = None, blind_mode: bool = False, db: Session = Depends(get_db)):
+    query = db.query(Ranking).filter(Ranking.job_id == job_id).order_by(Ranking.final_score.desc())
+    if limit:
+        query = query.limit(limit)
+    rankings = query.all()
 
     result = []
     for r in rankings:
@@ -107,7 +110,8 @@ def get_rankings(job_id: int, blind_mode: bool = False, db: Session = Depends(ge
             "final_score": r.final_score,
             "total_experience": r.candidate.total_experience_years,
             "matched_skills": json.loads(r.matched_skills_json) if r.matched_skills_json else [],
-            "missing_skills": json.loads(r.missing_skills_json) if r.missing_skills_json else []
+            "missing_skills": json.loads(r.missing_skills_json) if r.missing_skills_json else [],
+            "risk_flag": r.risk_flag
         })
     return result
 
@@ -170,6 +174,7 @@ def process_cv_batch(job_id: int, file_paths: List[str], candidate_names: List[s
                 cv_text=text,
                 cv_embedding=cv_embedding,
                 experience_years=exp_years,
+                exp_section_text=sections['experience'],
                 required_experience=0, # Default, could be extracted from JD
                 semantic_weight=job.semantic_weight
             )
@@ -187,7 +192,8 @@ def process_cv_batch(job_id: int, file_paths: List[str], candidate_names: List[s
                     experience_score=scores['experience_score'],
                     final_score=scores['final_score'],
                     matched_skills_json=json.dumps(matched),
-                    missing_skills_json=json.dumps(missing)
+                    missing_skills_json=json.dumps(missing),
+                    risk_flag=scores['risk_flag']
                 )
                 db.add(ranking)
             else:
@@ -196,6 +202,7 @@ def process_cv_batch(job_id: int, file_paths: List[str], candidate_names: List[s
                 ranking.final_score = scores['final_score']
                 ranking.matched_skills_json = json.dumps(matched)
                 ranking.missing_skills_json = json.dumps(missing)
+                ranking.risk_flag = scores['risk_flag']
 
             db.commit()
     except Exception as e:

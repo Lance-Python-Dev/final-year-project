@@ -80,6 +80,7 @@ class Ranking(Base):
     final_score = Column(Float)
     matched_skills_json = Column(Text, nullable=True) # Stores list of skill names as JSON for easy display
     missing_skills_json = Column(Text, nullable=True) # Stores list of missing skill names as JSON
+    risk_flag = Column(String(100), nullable=True) # Flags like "Potential Keyword Stuffing Detected"
 
     job = relationship("Job", back_populates="rankings")
     candidate = relationship("Candidate", back_populates="rankings")
