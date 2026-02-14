@@ -10,6 +10,8 @@ function App() {
   const [rankings, setRankings] = useState([]);
   const [jobTitle, setJobTitle] = useState('');
   const [jobDescription, setJobDescription] = useState('');
+  const [semanticWeight, setSemanticWeight] = useState(0.8);
+  const [blindMode, setBlindMode] = useState(false);
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -33,7 +35,8 @@ function App() {
     try {
       const response = await axios.post(`${API_BASE_URL}/jobs`, {
         title: jobTitle,
-        description: jobDescription
+        description: jobDescription,
+        semantic_weight: semanticWeight
       });
       setJobs([...jobs, response.data]);
       setSelectedJob(response.data);
@@ -69,7 +72,7 @@ function App() {
     if (!selectedJob) return;
     setLoading(true);
     try {
-      const response = await axios.get(`${API_BASE_URL}/jobs/${selectedJob.id}/rankings`);
+      const response = await axios.get(`${API_BASE_URL}/jobs/${selectedJob.id}/rankings?blind_mode=${blindMode}`);
       setRankings(response.data);
     } catch (error) {
       console.error("Error fetching rankings:", error);
@@ -77,6 +80,12 @@ function App() {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (selectedJob) {
+      fetchRankings();
+    }
+  }, [blindMode]);
 
   return (
     <div className="min-h-screen bg-gray-100 p-4 md:p-8 font-sans">
@@ -112,6 +121,18 @@ function App() {
                 onChange={(e) => setJobDescription(e.target.value)}
                 required
               />
+              <div className="space-y-1">
+                <label className="text-xs font-bold text-gray-500 flex justify-between">
+                  <span>Skill vs Experience Weight</span>
+                  <span>{Math.round(semanticWeight * 100)}% / {Math.round((1 - semanticWeight) * 100)}%</span>
+                </label>
+                <input
+                  type="range" min="0" max="1" step="0.1"
+                  value={semanticWeight}
+                  onChange={(e) => setSemanticWeight(parseFloat(e.target.value))}
+                  className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                />
+              </div>
               <button
                 type="submit"
                 disabled={loading}
@@ -151,7 +172,16 @@ function App() {
                     <h2 className="text-2xl font-bold text-gray-800">{selectedJob.title}</h2>
                     <p className="text-gray-500 line-clamp-1">{selectedJob.description}</p>
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-3">
+                    <div className="flex items-center gap-2 bg-white border border-gray-200 px-3 py-1 rounded-full shadow-sm">
+                      <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">Blind Mode</span>
+                      <button
+                        onClick={() => setBlindMode(!blindMode)}
+                        className={`w-10 h-5 rounded-full relative transition-colors ${blindMode ? 'bg-blue-600' : 'bg-gray-300'}`}
+                      >
+                        <div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${blindMode ? 'left-6' : 'left-1'}`}></div>
+                      </button>
+                    </div>
                     <button
                       onClick={fetchRankings}
                       className="flex items-center gap-2 bg-gray-100 text-gray-700 px-4 py-2 rounded hover:bg-gray-200 transition"
@@ -233,17 +263,26 @@ function App() {
                             <span className="text-sm font-bold text-blue-700">{(r.final_score * 100).toFixed(1)}</span>
                           </td>
                           <td className="px-6 py-4">
-                            <div className="flex flex-wrap gap-1">
-                              {r.matched_skills.slice(0, 3).map((skill, i) => (
-                                <span key={i} className="text-[10px] bg-green-100 text-green-700 px-2 py-0.5 rounded-full border border-green-200">
-                                  {skill}
-                                </span>
-                              ))}
-                              {r.matched_skills.length > 3 && (
-                                <span className="text-[10px] bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">
-                                  +{r.matched_skills.length - 3} more
-                                </span>
-                              )}
+                            <div className="flex flex-col gap-1">
+                              <div className="flex flex-wrap gap-1">
+                                {r.matched_skills.slice(0, 3).map((skill, i) => (
+                                  <span key={i} className="text-[10px] bg-green-100 text-green-700 px-2 py-0.5 rounded-full border border-green-200">
+                                    {skill}
+                                  </span>
+                                ))}
+                                {r.matched_skills.length > 3 && (
+                                  <span className="text-[10px] bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">
+                                    +{r.matched_skills.length - 3} more
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex flex-wrap gap-1">
+                                {r.missing_skills.slice(0, 2).map((skill, i) => (
+                                  <span key={i} className="text-[10px] bg-red-50 text-red-600 px-2 py-0.5 rounded-full border border-red-100 italic">
+                                    -{skill}
+                                  </span>
+                                ))}
+                              </div>
                             </div>
                           </td>
                         </tr>

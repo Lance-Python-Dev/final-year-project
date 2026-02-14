@@ -34,6 +34,7 @@ class Job(Base):
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=False)
     recruiter_id = Column(Integer, ForeignKey("recruiter.id"))
+    semantic_weight = Column(Float, default=0.8) # Weight for semantic score (0.0 to 1.0)
     embedding = Column(LargeBinary, nullable=True) # Stores the 384-dim vector as pickled numpy array
 
     recruiter = relationship("Recruiter", back_populates="jobs")
@@ -78,6 +79,7 @@ class Ranking(Base):
     experience_score = Column(Float)
     final_score = Column(Float)
     matched_skills_json = Column(Text, nullable=True) # Stores list of skill names as JSON for easy display
+    missing_skills_json = Column(Text, nullable=True) # Stores list of missing skill names as JSON
 
     job = relationship("Job", back_populates="rankings")
     candidate = relationship("Candidate", back_populates="rankings")

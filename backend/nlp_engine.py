@@ -112,22 +112,60 @@ class NLPEngine:
             return datetime(int(year_match.group(0)), 1, 1)
         raise ValueError(f"Could not parse date: {date_str}")
 
+    def mask_pii_and_gendered_language(self, text):
+        """Redact PII (Names, Emails) and mask gendered language for blind screening."""
+        doc = self.nlp(text)
+        result_tokens = []
+
+        # Masking rules
+        gender_map = {
+            "he": "they", "she": "they", "him": "them", "her": "them", "his": "their", "hers": "theirs",
+            "himself": "themselves", "herself": "themselves", "chairman": "chairperson",
+            "businessman": "businessperson", "businesswoman": "businessperson"
+        }
+
+        # We'll use a simple token-based replacement for gendered words
+        # and spaCy NER for PII (PERSON, EMAIL not always a label but we can find it)
+
+        # First pass: find Person entities to mask
+        person_entities = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
+
+        for token in doc:
+            token_text = token.text
+            lower_text = token_text.lower()
+
+            # 1. Mask Gendered Language
+            if lower_text in gender_map:
+                result_tokens.append(gender_map[lower_text])
+            # 2. Mask Persons
+            elif any(token_text in p for p in person_entities):
+                result_tokens.append("[Candidate Name]")
+            # 3. Mask Emails (Simple Regex match since spaCy doesn't always label them)
+            elif "@" in token_text and "." in token_text:
+                result_tokens.append("[Email Masked]")
+            else:
+                result_tokens.append(token_text)
+
+        # Reconstruct text with spacing
+        return "".join([t + (doc[i].whitespace_ if i < len(doc) else "") for i, t in enumerate(result_tokens)])
+
     def get_embedding(self, text):
         return self.model.encode(text)
 
     def calculate_similarity(self, embedding1, embedding2):
         return util.cos_sim(embedding1, embedding2).item()
 
-    def rank_candidate(self, jd_text, jd_embedding, cv_text, cv_embedding, experience_years, required_experience=0):
-        # Semantic Score (80%)
+    def rank_candidate(self, jd_text, jd_embedding, cv_text, cv_embedding, experience_years, required_experience=0, semantic_weight=0.8):
+        # Semantic Score
         semantic_score = self.calculate_similarity(jd_embedding, cv_embedding)
 
-        # Experience Score (20%)
-        # If required_experience is 0, we'll give a full score if they have any, or cap at 10 years.
+        # Experience Score
         target_exp = required_experience if required_experience > 0 else 5.0
         exp_score = min(experience_years / target_exp, 1.0)
 
-        final_score = (semantic_score * 0.8) + (exp_score * 0.2)
+        # Dynamic weighting
+        exp_weight = 1.0 - semantic_weight
+        final_score = (semantic_score * semantic_weight) + (exp_score * exp_weight)
 
         return {
             "semantic_score": round(semantic_score, 4),
