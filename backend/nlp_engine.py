@@ -69,24 +69,42 @@ class NLPEngine:
         return list(skills)
 
     def calculate_experience_years(self, experience_text):
-        """Extract years of experience from text using regex for date patterns."""
+        """Extract years of experience from text using regex for date patterns, with Weighted Recency."""
         # Pattern for date ranges like "Jan 2020 - Dec 2022", "2018-2021", "2015 - Present"
         date_pattern = r'(\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}|\d{4})\s*[-–—to]+\s*(Present|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}|\d{4})'
 
         matches = re.findall(date_pattern, experience_text, re.IGNORECASE)
         total_years = 0.0
+        weighted_years = 0.0
+        now = datetime.now()
 
         for start, end in matches:
             try:
                 start_date = self._parse_date(start)
                 if end.lower() == "present":
-                    end_date = datetime.now()
+                    end_date = now
                 else:
                     end_date = self._parse_date(end)
 
                 diff = (end_date - start_date).days / 365.25
                 if diff > 0:
                     total_years += diff
+
+                    # Weighted Recency Calculation
+                    # Experience in the last 3 years: 1.2x weight
+                    # Experience older than 3 years: 0.8x weight (for the portion that is old)
+                    three_years_ago = now.replace(year=now.year - 3)
+
+                    if end_date > three_years_ago:
+                        # Some or all of this role is within the last 3 years
+                        recent_start = max(start_date, three_years_ago)
+                        recent_diff = (end_date - recent_start).days / 365.25
+                        old_diff = (recent_start - start_date).days / 365.25
+
+                        weighted_years += (recent_diff * 1.2) + (max(0, old_diff) * 0.8)
+                    else:
+                        # All of this role is older than 3 years
+                        weighted_years += diff * 0.8
             except:
                 continue
 
@@ -95,8 +113,9 @@ class NLPEngine:
             years_match = re.search(r'(\d+)\+?\s*years?', experience_text, re.IGNORECASE)
             if years_match:
                 total_years = float(years_match.group(1))
+                weighted_years = total_years # Can't accurately weight without dates
 
-        return round(total_years, 1)
+        return round(total_years, 1), round(weighted_years, 1)
 
     def _parse_date(self, date_str):
         # Support various formats
@@ -112,26 +131,79 @@ class NLPEngine:
             return datetime(int(year_match.group(0)), 1, 1)
         raise ValueError(f"Could not parse date: {date_str}")
 
+    def mask_pii_and_gendered_language(self, text):
+        """Redact PII (Names, Emails) and mask gendered language for blind screening."""
+        doc = self.nlp(text)
+        result_tokens = []
+
+        # Masking rules
+        gender_map = {
+            "he": "they", "she": "they", "him": "them", "her": "them", "his": "their", "hers": "theirs",
+            "himself": "themselves", "herself": "themselves", "chairman": "chairperson",
+            "businessman": "businessperson", "businesswoman": "businessperson"
+        }
+
+        # First pass: find Person entities to mask
+        person_entities = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
+
+        for token in doc:
+            token_text = token.text
+            lower_text = token_text.lower()
+
+            # 1. Mask Gendered Language
+            if lower_text in gender_map:
+                result_tokens.append(gender_map[lower_text])
+            # 2. Mask Persons
+            elif any(token_text in p for p in person_entities):
+                result_tokens.append("[Candidate Name]")
+            # 3. Mask Emails (Simple Regex match)
+            elif "@" in token_text and "." in token_text:
+                result_tokens.append("[Email Masked]")
+            else:
+                result_tokens.append(token_text)
+
+        # Reconstruct text with spacing
+        return "".join([t + (doc[i].whitespace_ if i < len(doc) else "") for i, t in enumerate(result_tokens)])
+
     def get_embedding(self, text):
         return self.model.encode(text)
 
     def calculate_similarity(self, embedding1, embedding2):
         return util.cos_sim(embedding1, embedding2).item()
 
-    def rank_candidate(self, jd_text, jd_embedding, cv_text, cv_embedding, experience_years, required_experience=0):
-        # Semantic Score (80%)
+    def rank_candidate(self, jd_text, jd_embedding, cv_text, cv_embedding, experience_years, weighted_experience_years=None, exp_section_text="", required_experience=0, semantic_weight=0.8):
+        # Semantic Score
         semantic_score = self.calculate_similarity(jd_embedding, cv_embedding)
 
-        # Experience Score (20%)
-        # If required_experience is 0, we'll give a full score if they have any, or cap at 10 years.
+        # Experience Score (using Weighted Recency if available)
+        exp_to_use = weighted_experience_years if weighted_experience_years is not None else experience_years
         target_exp = required_experience if required_experience > 0 else 5.0
-        exp_score = min(experience_years / target_exp, 1.0)
+        exp_score = min(exp_to_use / target_exp, 1.0)
 
-        final_score = (semantic_score * 0.8) + (exp_score * 0.2)
+        # Anti-Gaming Check (Similarity Variance)
+        risk_flag = None
+        similarity_variance = 0.0
+        if exp_section_text:
+            exp_section_embedding = self.get_embedding(exp_section_text)
+            exp_section_similarity = self.calculate_similarity(jd_embedding, exp_section_embedding)
+
+            # Variance = (Full Match - Exp Section Match) / Full Match
+            if semantic_score > 0:
+                similarity_variance = (semantic_score - exp_section_similarity) / semantic_score
+
+            if similarity_variance > 0.35:
+                risk_flag = "High Risk: Potential Keyword Stuffing"
+
+        # Dynamic weighting
+        exp_weight = 1.0 - semantic_weight
+        final_score = (semantic_score * semantic_weight) + (exp_score * exp_weight)
 
         return {
             "semantic_score": round(semantic_score, 4),
             "experience_score": round(exp_score, 4),
             "final_score": round(final_score, 4),
-            "extracted_experience": experience_years
+            "extracted_experience": experience_years,
+            "weighted_experience": weighted_experience_years,
+            "similarity_variance": round(similarity_variance, 4),
+            "risk_flag": risk_flag
         }
