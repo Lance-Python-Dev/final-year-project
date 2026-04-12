@@ -26,18 +26,20 @@ app.add_middleware(
 )
 
 # Initialize NLP Engine
-nlp_engine = nlp_engine = NLPEngine()
+nlp_engine = NLPEngine()
 
 # Pydantic models for API
 class JobCreateSchema(BaseModel):
     title: str
     description: str
     recruiter_id: int = 1
+    semantic_weight: float = 0.8
 
 class JobResponse(BaseModel):
     id: int
     title: str
     description: str
+    semantic_weight: float
 
     class Config:
         from_attributes = True
@@ -58,6 +60,7 @@ def create_job(job_data: JobCreateSchema, db: Session = Depends(get_db)):
         title=job_data.title,
         description=job_data.description,
         recruiter_id=job_data.recruiter_id,
+        semantic_weight=job_data.semantic_weight,
         embedding=pickle.dumps(embedding)
     )
     db.add(new_job)
@@ -83,20 +86,33 @@ def list_jobs(db: Session = Depends(get_db)):
     return db.query(Job).all()
 
 @app.get("/jobs/{job_id}/rankings")
-def get_rankings(job_id: int, db: Session = Depends(get_db)):
-    rankings = db.query(Ranking).filter(Ranking.job_id == job_id).order_by(Ranking.final_score.desc()).all()
+def get_rankings(job_id: int, limit: int = None, blind_mode: bool = False, db: Session = Depends(get_db)):
+    query = db.query(Ranking).filter(Ranking.job_id == job_id).order_by(Ranking.final_score.desc())
+    if limit:
+        query = query.limit(limit)
+    rankings = query.all()
 
     result = []
     for r in rankings:
+        candidate_name = r.candidate.name
+        email = r.candidate.email
+
+        if blind_mode:
+            candidate_name = f"Candidate #{r.candidate_id}"
+            email = "[Masked for Blind Screening]"
+
         result.append({
             "candidate_id": r.candidate_id,
-            "candidate_name": r.candidate.name,
-            "email": r.candidate.email,
+            "candidate_name": candidate_name,
+            "email": email,
             "semantic_score": r.semantic_score,
             "experience_score": r.experience_score,
             "final_score": r.final_score,
             "total_experience": r.candidate.total_experience_years,
-            "matched_skills": json.loads(r.matched_skills_json) if r.matched_skills_json else []
+            "matched_skills": json.loads(r.matched_skills_json) if r.matched_skills_json else [],
+            "missing_skills": json.loads(r.missing_skills_json) if r.missing_skills_json else [],
+            "similarity_variance": r.similarity_variance,
+            "risk_flag": r.risk_flag
         })
     return result
 
@@ -120,7 +136,7 @@ def process_cv_batch(job_id: int, file_paths: List[str], candidate_names: List[s
             # 2. Segment and NLP
             sections = nlp_engine.segment_text(text)
             cv_skills = nlp_engine.extract_skills(text)
-            exp_years = nlp_engine.calculate_experience_years(sections['experience'] or text)
+            exp_years, weighted_exp_years = nlp_engine.calculate_experience_years(sections['experience'] or text)
             cv_embedding = nlp_engine.get_embedding(text)
 
             # 3. Create/Update Candidate
@@ -159,11 +175,15 @@ def process_cv_batch(job_id: int, file_paths: List[str], candidate_names: List[s
                 cv_text=text,
                 cv_embedding=cv_embedding,
                 experience_years=exp_years,
-                required_experience=0 # Default, could be extracted from JD
+                weighted_experience_years=weighted_exp_years,
+                exp_section_text=sections['experience'],
+                required_experience=0, # Default, could be extracted from JD
+                semantic_weight=job.semantic_weight
             )
 
-            # Matched Skills
+            # Matched & Missing Skills
             matched = list(set(job_skills_list) & set(cv_skills))
+            missing = list(set(job_skills_list) - set(cv_skills))
 
             ranking = db.query(Ranking).filter(Ranking.job_id == job_id, Ranking.candidate_id == candidate.id).first()
             if not ranking:
@@ -173,7 +193,10 @@ def process_cv_batch(job_id: int, file_paths: List[str], candidate_names: List[s
                     semantic_score=scores['semantic_score'],
                     experience_score=scores['experience_score'],
                     final_score=scores['final_score'],
-                    matched_skills_json=json.dumps(matched)
+                    matched_skills_json=json.dumps(matched),
+                    missing_skills_json=json.dumps(missing),
+                    similarity_variance=scores['similarity_variance'],
+                    risk_flag=scores['risk_flag']
                 )
                 db.add(ranking)
             else:
@@ -181,6 +204,9 @@ def process_cv_batch(job_id: int, file_paths: List[str], candidate_names: List[s
                 ranking.experience_score = scores['experience_score']
                 ranking.final_score = scores['final_score']
                 ranking.matched_skills_json = json.dumps(matched)
+                ranking.missing_skills_json = json.dumps(missing)
+                ranking.similarity_variance = scores['similarity_variance']
+                ranking.risk_flag = scores['risk_flag']
 
             db.commit()
     except Exception as e:
