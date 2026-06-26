@@ -3,7 +3,10 @@ import shutil
 import uuid
 import json
 import pickle
-from typing import List
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import List, Optional
 from fastapi import FastAPI, Depends, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -35,11 +38,16 @@ class JobCreateSchema(BaseModel):
     recruiter_id: int = 1
     semantic_weight: float = 0.8
 
+class SendEmailsRequest(BaseModel):
+    subject: str
+    body: str
+    candidate_ids: List[int]
+
 class JobResponse(BaseModel):
     id: int
     title: str
     description: str
-    semantic_weight: float
+    semantic_weight: Optional[float] = 0.8
 
     class Config:
         from_attributes = True
@@ -47,6 +55,9 @@ class JobResponse(BaseModel):
 # Helper to ensure upload directory exists
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# In-memory tracker for background CV processing progress: {job_id: {"total": int, "processed": int}}
+processing_status = {}
 
 @app.get("/")
 def read_root():
@@ -66,7 +77,7 @@ def create_job(job_data: JobCreateSchema, db: Session = Depends(get_db)):
     db.add(new_job)
     db.flush() # Get ID
 
-    # Extract and store job skills
+    # Extract and store job skills using improved phrase-level extractor
     skills = nlp_engine.extract_skills(job_data.description)
     for skill_name in skills:
         skill = db.query(Skill).filter(Skill.name == skill_name).first()
@@ -84,6 +95,17 @@ def create_job(job_data: JobCreateSchema, db: Session = Depends(get_db)):
 @app.get("/jobs", response_model=List[JobResponse])
 def list_jobs(db: Session = Depends(get_db)):
     return db.query(Job).all()
+
+@app.get("/jobs/{job_id}/status")
+def get_job_status(job_id: int):
+    status = processing_status.get(job_id, {"total": 0, "processed": 0})
+    total = status["total"]
+    processed = status["processed"]
+    return {
+        "total": total,
+        "processed": processed,
+        "is_complete": processed >= total if total > 0 else True,
+    }
 
 @app.get("/jobs/{job_id}/rankings")
 def get_rankings(job_id: int, limit: int = None, blind_mode: bool = False, db: Session = Depends(get_db)):
@@ -117,7 +139,6 @@ def get_rankings(job_id: int, limit: int = None, blind_mode: bool = False, db: S
     return result
 
 def process_cv_batch(job_id: int, file_paths: List[str], candidate_names: List[str], candidate_emails: List[str], db_session_factory):
-    # This runs in background
     db = db_session_factory()
     try:
         job = db.query(Job).filter(Job.id == job_id).first()
@@ -125,90 +146,106 @@ def process_cv_batch(job_id: int, file_paths: List[str], candidate_names: List[s
             return
 
         job_embedding = pickle.loads(job.embedding)
-        job_skills_list = [s.name for s in job.skills]
+        required_exp = nlp_engine.extract_required_experience(job.description)
+        # Re-extract JD skills fresh using the improved multi-word extractor
+        # (stored job.skills may have been created with the old single-token extractor)
+        jd_skills_fresh = set(nlp_engine.extract_skills(job.description))
 
         for file_path, name, email in zip(file_paths, candidate_names, candidate_emails):
-            # 1. Parse text
-            text = extract_text(file_path)
-            if not text:
-                continue
+            try:
+                # 1. Parse text
+                text = extract_text(file_path)
+                if not text:
+                    continue
 
-            # 2. Segment and NLP
-            sections = nlp_engine.segment_text(text)
-            cv_skills = nlp_engine.extract_skills(text)
-            exp_years, weighted_exp_years = nlp_engine.calculate_experience_years(sections['experience'] or text)
-            cv_embedding = nlp_engine.get_embedding(text)
+                # 2. Segment and NLP
+                sections = nlp_engine.segment_text(text)
+                # Use full text for experience extraction as fallback when section is empty
+                exp_source = sections['experience'] if sections['experience'].strip() else text
+                exp_years, weighted_exp_years = nlp_engine.calculate_experience_years(exp_source)
+                # Embed full CV text (first 1800 chars — see NLPEngine.get_embedding)
+                cv_embedding = nlp_engine.get_embedding(text)
+                # Fresh skill extraction uses improved phrase-level regex
+                cv_skills = nlp_engine.extract_skills(text)
 
-            # 3. Create/Update Candidate
-            candidate = db.query(Candidate).filter(Candidate.email == email).first()
-            if not candidate:
-                candidate = Candidate(name=name, email=email, total_experience_years=exp_years)
-                db.add(candidate)
-                db.flush()
-            else:
-                candidate.total_experience_years = exp_years
-
-            # 4. Save CV Document
-            cv_doc = db.query(CVDocument).filter(CVDocument.candidate_id == candidate.id).first()
-            if not cv_doc:
-                cv_doc = CVDocument(candidate_id=candidate.id, file_path=file_path, raw_text=text, embedding=pickle.dumps(cv_embedding))
-                db.add(cv_doc)
-            else:
-                cv_doc.file_path = file_path
-                cv_doc.raw_text = text
-                cv_doc.embedding = pickle.dumps(cv_embedding)
-
-            # 5. Handle Skills
-            for s_name in cv_skills:
-                skill = db.query(Skill).filter(Skill.name == s_name).first()
-                if not skill:
-                    skill = Skill(name=s_name)
-                    db.add(skill)
+                # 3. Create/Update Candidate
+                candidate = db.query(Candidate).filter(Candidate.email == email).first()
+                if not candidate:
+                    candidate = Candidate(name=name, email=email, total_experience_years=exp_years)
+                    db.add(candidate)
                     db.flush()
-                if skill not in candidate.skills:
-                    candidate.skills.append(skill)
+                else:
+                    candidate.total_experience_years = exp_years
 
-            # 6. Calculate Ranking
-            scores = nlp_engine.rank_candidate(
-                jd_text=job.description,
-                jd_embedding=job_embedding,
-                cv_text=text,
-                cv_embedding=cv_embedding,
-                experience_years=exp_years,
-                weighted_experience_years=weighted_exp_years,
-                exp_section_text=sections['experience'],
-                required_experience=0, # Default, could be extracted from JD
-                semantic_weight=job.semantic_weight
-            )
+                # 4. Save CV Document
+                cv_doc = db.query(CVDocument).filter(CVDocument.candidate_id == candidate.id).first()
+                if not cv_doc:
+                    cv_doc = CVDocument(candidate_id=candidate.id, file_path=file_path, raw_text=text, embedding=pickle.dumps(cv_embedding))
+                    db.add(cv_doc)
+                else:
+                    cv_doc.file_path = file_path
+                    cv_doc.raw_text = text
+                    cv_doc.embedding = pickle.dumps(cv_embedding)
 
-            # Matched & Missing Skills
-            matched = list(set(job_skills_list) & set(cv_skills))
-            missing = list(set(job_skills_list) - set(cv_skills))
+                # 5. Handle Skills
+                for s_name in cv_skills:
+                    skill = db.query(Skill).filter(Skill.name == s_name).first()
+                    if not skill:
+                        skill = Skill(name=s_name)
+                        db.add(skill)
+                        db.flush()
+                    if skill not in candidate.skills:
+                        candidate.skills.append(skill)
 
-            ranking = db.query(Ranking).filter(Ranking.job_id == job_id, Ranking.candidate_id == candidate.id).first()
-            if not ranking:
-                ranking = Ranking(
-                    job_id=job_id,
-                    candidate_id=candidate.id,
-                    semantic_score=scores['semantic_score'],
-                    experience_score=scores['experience_score'],
-                    final_score=scores['final_score'],
-                    matched_skills_json=json.dumps(matched),
-                    missing_skills_json=json.dumps(missing),
-                    similarity_variance=scores['similarity_variance'],
-                    risk_flag=scores['risk_flag']
+                # 6. Calculate Ranking
+                scores = nlp_engine.rank_candidate(
+                    jd_text=job.description,
+                    jd_embedding=job_embedding,
+                    cv_text=text,
+                    cv_embedding=cv_embedding,
+                    experience_years=exp_years,
+                    weighted_experience_years=weighted_exp_years,
+                    exp_section_text=sections['experience'],
+                    skills_section_text=sections['skills'],
+                    required_experience=required_exp,
+                    semantic_weight=job.semantic_weight
                 )
-                db.add(ranking)
-            else:
-                ranking.semantic_score = scores['semantic_score']
-                ranking.experience_score = scores['experience_score']
-                ranking.final_score = scores['final_score']
-                ranking.matched_skills_json = json.dumps(matched)
-                ranking.missing_skills_json = json.dumps(missing)
-                ranking.similarity_variance = scores['similarity_variance']
-                ranking.risk_flag = scores['risk_flag']
 
-            db.commit()
+                # Matched & Missing Skills — use fresh JD skills (multi-word aware)
+                cv_skills_set = set(scores.get('cv_skills', cv_skills))
+                matched = sorted(jd_skills_fresh & cv_skills_set)
+                missing = sorted(jd_skills_fresh - cv_skills_set)
+
+                ranking = db.query(Ranking).filter(Ranking.job_id == job_id, Ranking.candidate_id == candidate.id).first()
+                if not ranking:
+                    ranking = Ranking(
+                        job_id=job_id,
+                        candidate_id=candidate.id,
+                        semantic_score=scores['semantic_score'],
+                        experience_score=scores['experience_score'],
+                        final_score=scores['final_score'],
+                        matched_skills_json=json.dumps(matched),
+                        missing_skills_json=json.dumps(missing),
+                        similarity_variance=scores['similarity_variance'],
+                        risk_flag=scores['risk_flag']
+                    )
+                    db.add(ranking)
+                else:
+                    ranking.semantic_score = scores['semantic_score']
+                    ranking.experience_score = scores['experience_score']
+                    ranking.final_score = scores['final_score']
+                    ranking.matched_skills_json = json.dumps(matched)
+                    ranking.missing_skills_json = json.dumps(missing)
+                    ranking.similarity_variance = scores['similarity_variance']
+                    ranking.risk_flag = scores['risk_flag']
+
+                db.commit()
+            except Exception as e:
+                print(f"Error processing CV {file_path}: {e}")
+                db.rollback()
+            finally:
+                if job_id in processing_status:
+                    processing_status[job_id]["processed"] += 1
     except Exception as e:
         print(f"Error in background processing: {e}")
         db.rollback()
@@ -221,29 +258,103 @@ async def upload_cvs(job_id: int, background_tasks: BackgroundTasks, files: List
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    file_paths = []
-    names = []
-    emails = []
+    CV_EXTENSIONS = {'.pdf', '.docx'}
+    MAX_CVS = 50
+
+    file_paths, names, emails = [], [], []
 
     for file in files:
-        file_ext = os.path.splitext(file.filename)[1]
-        unique_filename = f"{uuid.uuid4()}{file_ext}"
-        file_path = os.path.join(UPLOAD_DIR, unique_filename)
-
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        file_paths.append(file_path)
-        name = file.filename.split('.')[0].replace('_', ' ').title()
+        if os.path.splitext(file.filename)[1].lower() not in CV_EXTENSIONS:
+            continue
+        dest = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}{os.path.splitext(file.filename)[1].lower()}")
+        with open(dest, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
+        name = os.path.splitext(os.path.basename(file.filename))[0].replace('_', ' ').replace('-', ' ').title()
         email = f"{name.lower().replace(' ', '.')}@example.com"
+        file_paths.append(dest)
         names.append(name)
         emails.append(email)
 
-    # Start background processing
+    if not file_paths:
+        raise HTTPException(status_code=400, detail="No valid CVs found. Upload PDF or DOCX files.")
+    if len(file_paths) > MAX_CVS:
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_CVS} CVs per upload. Found {len(file_paths)}.")
+
+    processing_status[job_id] = {"total": len(file_paths), "processed": 0}
+
     from database import SessionLocal
     background_tasks.add_task(process_cv_batch, job_id, file_paths, names, emails, SessionLocal)
 
-    return {"message": f"Successfully uploaded {len(files)} CVs. Processing started in background.", "job_id": job_id}
+    return {
+        "message": f"Successfully queued {len(file_paths)} CVs for processing.",
+        "job_id": job_id,
+        "cv_count": len(file_paths),
+    }
+
+@app.post("/jobs/{job_id}/send-emails")
+def send_candidate_emails(job_id: int, req: SendEmailsRequest, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    from_name = os.getenv("FROM_NAME", "AI Recruit Architect")
+
+    if not all([smtp_host, smtp_user, smtp_password]):
+        raise HTTPException(
+            status_code=500,
+            detail="Email not configured. Add SMTP_HOST, SMTP_USER, SMTP_PASSWORD to backend/.env"
+        )
+
+    from models import Candidate
+    candidates = db.query(Candidate).filter(Candidate.id.in_(req.candidate_ids)).all()
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No matching candidates found")
+
+    sent, failed = [], []
+    try:
+        server = smtplib.SMTP(smtp_host, smtp_port)
+        server.ehlo()
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+
+        for candidate in candidates:
+            try:
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = req.subject
+                msg["From"] = f"{from_name} <{smtp_user}>"
+                msg["To"] = candidate.email
+
+                personalized = req.body.replace("{{name}}", candidate.name)
+                html_body = personalized.replace("\n", "<br>")
+                html = f"""
+                <html><body style="font-family:Georgia,serif;color:#2C1A0E;max-width:600px;margin:0 auto;padding:32px;">
+                  <div style="border-top:4px solid #7C4F2A;padding-top:24px;">
+                    <h2 style="color:#7C4F2A;margin:0 0 24px;">{from_name}</h2>
+                    <div style="line-height:1.8;font-size:15px;">{html_body}</div>
+                    <hr style="border:none;border-top:1px solid #DFC9B0;margin:32px 0;">
+                    <p style="font-size:12px;color:#A89280;">This message was sent by the AI Recruit Architect platform.</p>
+                  </div>
+                </body></html>"""
+
+                msg.attach(MIMEText(personalized, "plain"))
+                msg.attach(MIMEText(html, "html"))
+                server.sendmail(smtp_user, candidate.email, msg.as_string())
+                sent.append({"name": candidate.name, "email": candidate.email})
+            except Exception as e:
+                failed.append({"name": candidate.name, "email": candidate.email, "error": str(e)})
+
+        server.quit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SMTP connection failed: {str(e)}")
+
+    return {"sent": len(sent), "failed": len(failed), "sent_to": sent, "errors": failed}
+
 
 if __name__ == "__main__":
     import uvicorn
